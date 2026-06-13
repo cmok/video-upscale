@@ -82,6 +82,34 @@ uv run upscale.py compare-all input-videos/AVSEQ01.DAT -o grid_compare.mp4 --tri
 | `--aspect` | `-a` | Aspect ratio handling | `auto`, `source`, `4:3`, `16:9` | `auto` |
 | `--audio` | `-d` | Audio transcode operation | `copy`, `aac`, `none` | `aac` |
 | `--compare` | | Generate a side-by-side comparison | Flag | `False` |
+| `--quality` | `-q` | Encoder quality factor | `0-100` (HW) or `0-51` (CRF) | `65` (HW) / `18` (SW) |
+| `--denoise` | `-dn` | Apply spatial/temporal denoiser | Flag | `False` |
+| `--deblock` | `-db` | Apply MPEG deblocking filter | Flag | `False` |
+| `--sharpen` | `-sp` | Apply unsharp mask sharpening | Flag | `False` |
+
+---
+
+## Quality Fine-Tuning Examples
+
+For low-resolution Video CDs (`AVSEQ01.DAT`) with significant noise and macroblocks:
+
+### 1. High-Quality AI Upscaling with Denoising & Sharpening
+Smooth compression blocks and grain, upscale with FSRCNN, and apply an unsharp mask for fine-detail restoration:
+```bash
+uv run upscale.py upscale input-videos/AVSEQ01.DAT -o output_ai_fine.mp4 --engine fsrcnn --scale 2 --denoise --deblock --sharpen --trim 10
+```
+
+### 2. High-Speed hqx Upscaling with Deblocking & Sharpening
+Clean MPEG compression blocks, scale using C-based `hqx`, and sharpen boundaries:
+```bash
+uv run upscale.py upscale input-videos/AVSEQ01.DAT -o output_hqx_fine.mp4 --engine hqx --scale 4 --deblock --sharpen --trim 10
+```
+
+### 3. Ultra-Quality HEVC / H.265 Encode
+Upscale and encode using HEVC at quality factor 75 (instead of default 65) for pristine, high-fidelity results:
+```bash
+uv run upscale.py upscale input-videos/AVSEQ01.DAT -o output_hqx_hevc.mp4 --engine hqx --scale 4 --codec hevc --quality 75 --trim 10
+```
 
 ---
 

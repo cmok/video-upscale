@@ -168,20 +168,24 @@ def get_video_info(input_path):
         console.print(f"[bold red]Error probing video:[/bold red] {e}")
         sys.exit(1)
 
-def get_codec_params(codec_choice, is_mac):
+def get_codec_params(codec_choice, is_mac, custom_quality=None):
     """Returns the appropriate encoder and quality options."""
     if codec_choice == 'h264':
         if is_mac:
-            # Using hardware-accelerated Apple Silicon encoding
-            return 'h264_videotoolbox', ['-q:v', '65']
+            q = str(custom_quality) if custom_quality is not None else '65'
+            return 'h264_videotoolbox', ['-q:v', q]
         else:
-            return 'libx264', ['-crf', '18', '-preset', 'slow']
+            q = str(custom_quality) if custom_quality is not None else '18'
+            return 'libx264', ['-crf', q, '-preset', 'slow']
     elif codec_choice == 'hevc':
         if is_mac:
-            return 'hevc_videotoolbox', ['-q:v', '65']
+            q = str(custom_quality) if custom_quality is not None else '65'
+            return 'hevc_videotoolbox', ['-q:v', q]
         else:
-            return 'libx265', ['-crf', '20', '-preset', 'medium']
-    return 'libx264', ['-crf', '18', '-preset', 'slow']
+            q = str(custom_quality) if custom_quality is not None else '20'
+            return 'libx265', ['-crf', q, '-preset', 'medium']
+    q = str(custom_quality) if custom_quality is not None else '18'
+    return 'libx264', ['-crf', q, '-preset', 'slow']
 
 def download_fsrcnn_model(scale):
     """Downloads FSRCNN .pb model file and caches it locally."""
@@ -214,21 +218,35 @@ def download_fsrcnn_model(scale):
     console.print("Please download it manually and place it in [cyan].cache/models/[/cyan].")
     sys.exit(1)
 
-def get_ffmpeg_filter(engine, scale, target_width, target_height):
-    """Builds the FFmpeg filter string for the chosen engine."""
+def get_ffmpeg_filter(engine, scale, target_width, target_height, deblock=False, denoise=False, sharpen=False):
+    """Builds the FFmpeg filter string for the chosen engine, including pre/post quality enhancement filters."""
+    filters = []
+    if deblock:
+        filters.append("spp")
+    if denoise:
+        filters.append("hqdn3d=1.5:1.5:6:6")
+        
+    engine_filter = ""
     if engine == 'lanczos':
-        return f"scale={target_width}:{target_height}:flags=lanczos"
+        engine_filter = f"scale={target_width}:{target_height}:flags=lanczos"
     elif engine == 'hqx':
-        return f"hqx=n={scale},scale={target_width}:{target_height}:flags=lanczos"
+        engine_filter = f"hqx=n={scale},scale={target_width}:{target_height}:flags=lanczos"
     elif engine == 'xbr':
-        return f"xbr=n={scale},scale={target_width}:{target_height}:flags=lanczos"
+        engine_filter = f"xbr=n={scale},scale={target_width}:{target_height}:flags=lanczos"
     elif engine == 'epx':
         # epx only supports 2 and 3. For 4x, use epx=2 and scale the rest
         n = scale if scale in [2, 3] else 2
-        return f"epx=n={n},scale={target_width}:{target_height}:flags=lanczos"
+        engine_filter = f"epx=n={n},scale={target_width}:{target_height}:flags=lanczos"
     elif engine == 'super2xsai':
-        return f"super2xsai,scale={target_width}:{target_height}:flags=lanczos"
-    return f"scale={target_width}:{target_height}:flags=lanczos"
+        engine_filter = f"super2xsai,scale={target_width}:{target_height}:flags=lanczos"
+    else:
+        engine_filter = f"scale={target_width}:{target_height}:flags=lanczos"
+    filters.append(engine_filter)
+    
+    if sharpen:
+        filters.append("unsharp=5:5:0.4:5:5:0.0")
+        
+    return ",".join(filters)
 
 @click.group(invoke_without_command=True)
 @click.pass_context
@@ -353,7 +371,11 @@ def info(input_path):
 @click.option('--aspect', '-a', type=click.Choice(['auto', 'source', '4:3', '16:9']), default='auto', help="Aspect ratio handling.")
 @click.option('--audio', '-d', type=click.Choice(['copy', 'aac', 'none']), default='aac', help="Audio transcode action.")
 @click.option('--compare', is_flag=True, help="Create a side-by-side comparison video (original vs. upscaled).")
-def upscale(input_path, output, engine, scale, trim, codec, aspect, audio, compare):
+@click.option('--quality', '-q', type=int, help="Encoder quality factor. For VideoToolbox: 0-100 (default 65). For software: CRF 0-51 (lower is better, default 18/20).")
+@click.option('--denoise', '-dn', is_flag=True, help="Apply a spatial/temporal denoising filter before upscaling.")
+@click.option('--deblock', '-db', is_flag=True, help="Apply a deblocking filter before upscaling.")
+@click.option('--sharpen', '-sp', is_flag=True, help="Apply an unsharp mask (sharpening) filter after upscaling.")
+def upscale(input_path, output, engine, scale, trim, codec, aspect, audio, compare, quality, denoise, deblock, sharpen):
     """Upscale a video using mathematical, pixel-art, or AI-based models."""
     scale = int(scale)
     is_mac = sys.platform == 'darwin'
@@ -409,6 +431,14 @@ def upscale(input_path, output, engine, scale, trim, codec, aspect, audio, compa
     else:
         summary.add_row("[cyan]Trim Segment:[/cyan]", "Full Video")
     summary.add_row("[cyan]Codec:[/cyan]", f"{codec.upper()} ({'Hardware Accelerated' if is_mac else 'Software'})")
+    summary.add_row("[cyan]Encoder Quality:[/cyan]", str(quality) if quality is not None else "Default (65 for hardware, 18/20 for software)")
+    
+    enhancements = []
+    if deblock: enhancements.append("Deblock (spp)")
+    if denoise: enhancements.append("Denoise (hqdn3d/bilateral)")
+    if sharpen: enhancements.append("Sharpen (unsharp)")
+    summary.add_row("[cyan]Quality Enhancements:[/cyan]", ", ".join(enhancements) if enhancements else "None")
+    
     summary.add_row("[cyan]Audio Action:[/cyan]", audio.upper() if audio_stream else "None (Source lacks audio)")
     summary.add_row("[cyan]Comparison Video:[/cyan]", "YES (Split Screen)" if compare else "NO")
     
@@ -443,7 +473,11 @@ def upscale(input_path, output, engine, scale, trim, codec, aspect, audio, compa
                 audio_action=audio if audio_stream else 'none',
                 compare=compare,
                 is_mac=is_mac,
-                log_file_path=log_file_path
+                log_file_path=log_file_path,
+                custom_quality=quality,
+                deblock=deblock,
+                denoise=denoise,
+                sharpen=sharpen
             )
         else:
             # RUNNING NATIVE FFMPEG FILTERS (LANCZOS, HQX, XBR, EPX, SUPER2XSAI)
@@ -462,7 +496,11 @@ def upscale(input_path, output, engine, scale, trim, codec, aspect, audio, compa
                 audio_action=audio if audio_stream else 'none',
                 compare=compare,
                 is_mac=is_mac,
-                log_file_path=log_file_path
+                log_file_path=log_file_path,
+                custom_quality=quality,
+                deblock=deblock,
+                denoise=denoise,
+                sharpen=sharpen
             )
             
         console.print(f"\n[bold green]✓ Upscaling completed successfully![/bold green]")
@@ -484,7 +522,8 @@ def upscale(input_path, output, engine, scale, trim, codec, aspect, audio, compa
 
 def run_ffmpeg_pipeline(input_path, output_path, engine, scale, start_sec, duration_sec, 
                         target_w, target_h, fps, total_frames, codec_choice, audio_action, 
-                        compare, is_mac, log_file_path):
+                        compare, is_mac, log_file_path, custom_quality=None, 
+                        deblock=False, denoise=False, sharpen=False):
     """Executes the upscaling entirely within an FFmpeg subprocess using C-based filters."""
     ffmpeg_cmd = ['ffmpeg', '-y']
     
@@ -497,7 +536,7 @@ def run_ffmpeg_pipeline(input_path, output_path, engine, scale, start_sec, durat
     ffmpeg_cmd.extend(['-i', input_path])
     
     # 2. Filter Graph Construction
-    engine_filter = get_ffmpeg_filter(engine, scale, target_w, target_h)
+    engine_filter = get_ffmpeg_filter(engine, scale, target_w, target_h, deblock=deblock, denoise=denoise, sharpen=sharpen)
     
     if compare:
         font_path = get_font_file()
@@ -530,7 +569,7 @@ def run_ffmpeg_pipeline(input_path, output_path, engine, scale, start_sec, durat
         ffmpeg_cmd.extend(['-an'])
         
     # 4. Video encoding settings
-    encoder_name, quality_args = get_codec_params(codec_choice, is_mac)
+    encoder_name, quality_args = get_codec_params(codec_choice, is_mac, custom_quality=custom_quality)
     ffmpeg_cmd.extend(['-c:v', encoder_name])
     ffmpeg_cmd.extend(quality_args)
     
@@ -581,7 +620,8 @@ def run_ffmpeg_pipeline(input_path, output_path, engine, scale, start_sec, durat
 
 def run_fsrcnn_pipeline(input_path, output_path, model_path, scale, start_sec, duration_sec, 
                         target_w, target_h, fps, total_frames, codec_choice, audio_action, 
-                        compare, is_mac, log_file_path):
+                        compare, is_mac, log_file_path, custom_quality=None, 
+                        deblock=False, denoise=False, sharpen=False):
     """Executes the upscaling by reading frames using OpenCV, applying FSRCNN DNN, and piping to FFmpeg."""
     # 1. Initialize FSRCNN
     sr = cv2.dnn_superres.DnnSuperResImpl_create()
@@ -625,7 +665,7 @@ def run_fsrcnn_pipeline(input_path, output_path, model_path, scale, start_sec, d
     else:
         ffmpeg_cmd.extend(['-an'])
         
-    encoder_name, quality_args = get_codec_params(codec_choice, is_mac)
+    encoder_name, quality_args = get_codec_params(codec_choice, is_mac, custom_quality=custom_quality)
     ffmpeg_cmd.extend(['-c:v', encoder_name])
     ffmpeg_cmd.extend(quality_args)
     ffmpeg_cmd.append(output_path)
@@ -655,17 +695,21 @@ def run_fsrcnn_pipeline(input_path, output_path, model_path, scale, start_sec, d
                 if not ret:
                     break
                     
+                # Pre-processing: Deblock / Denoise using Bilateral Filter
+                if deblock or denoise:
+                    frame = cv2.bilateralFilter(frame, d=5, sigmaColor=50, sigmaSpace=50)
+                    
                 # Run AI Model
                 upscaled = sr.upsample(frame)
                 
                 # Aspect Ratio sizing check (if target dims are not exactly scaled dims)
                 if upscaled.shape[1] != target_w or upscaled.shape[0] != target_h:
-                    if compare:
-                        # Crop/Stack will handle sizing, but resize the base upscale first
-                        upscaled = cv2.resize(upscaled, (target_w, target_h), interpolation=cv2.INTER_LANCZOS4)
-                    else:
-                        # Resize to exact target dimension
-                        upscaled = cv2.resize(upscaled, (target_w, target_h), interpolation=cv2.INTER_LANCZOS4)
+                    upscaled = cv2.resize(upscaled, (target_w, target_h), interpolation=cv2.INTER_LANCZOS4)
+                
+                # Post-processing: Sharpen with Unsharp Mask
+                if sharpen:
+                    blurred = cv2.GaussianBlur(upscaled, (5, 5), 1.0)
+                    upscaled = cv2.addWeighted(upscaled, 1.5, blurred, -0.5, 0)
                 
                 if compare:
                     # Stretched or corrected bilinear resize for left half comparison
