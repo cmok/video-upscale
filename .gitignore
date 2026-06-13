@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+ENV/
+env/
+
+# Model Caches
+.cache/
+
+# OS-specific
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Generated test videos and upscaled output files
+*_upscaled.mp4
+*compare*.mp4
+test_*.mp4
+*_comparison_grid.mp4
