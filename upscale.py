@@ -47,6 +47,14 @@ def check_requirements():
             console.print("Please install FFmpeg to use this tool (e.g. [cyan]brew install ffmpeg[/cyan] on macOS).")
             sys.exit(1)
 
+def is_drawtext_available():
+    """Checks if the drawtext filter is available in FFmpeg."""
+    try:
+        res = subprocess.run(['ffmpeg', '-filters'], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        return "drawtext" in res.stdout
+    except Exception:
+        return False
+
 def get_font_file():
     """Locates a font file on the system for ffmpeg drawtext comparison labels."""
     paths = [
@@ -218,6 +226,310 @@ def download_fsrcnn_model(scale):
     console.print("Please download it manually and place it in [cyan].cache/models/[/cyan].")
     sys.exit(1)
 
+def download_realesrgan_binary():
+    """Downloads realesrgan-ncnn-vulkan binary and models, caches and configures them."""
+    cache_dir = Path("./.cache/realesrgan")
+    binary_path = cache_dir / "realesrgan-ncnn-vulkan"
+    models_dir = cache_dir / "models"
+    
+    if binary_path.exists() and models_dir.exists():
+        try:
+            os.chmod(binary_path, 0o755)
+        except Exception:
+            pass
+        return str(binary_path), str(models_dir)
+        
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    zip_path = cache_dir / "realesrgan-macos.zip"
+    url = "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesrgan-ncnn-vulkan-20220424-macos.zip"
+    
+    console.print("[yellow]Downloading Real-ESRGAN Vulkan engine (macOS Universal binary & models, ~49 MB)...[/yellow]")
+    try:
+        with urllib.request.urlopen(url, timeout=30) as response, open(zip_path, 'wb') as out_file:
+            data_len = int(response.headers.get('Content-Length', 0))
+            bytes_read = 0
+            with Progress(
+                TextColumn("[bold yellow]{task.description}"),
+                BarColumn(bar_width=40),
+                TaskProgressColumn(),
+                TimeRemainingColumn(),
+                console=console
+            ) as progress:
+                task_id = progress.add_task("Downloading...", total=data_len)
+                while True:
+                    chunk = response.read(1024 * 64)
+                    if not chunk:
+                        break
+                    out_file.write(chunk)
+                    bytes_read += len(chunk)
+                    progress.update(task_id, completed=bytes_read)
+                    
+        console.print("[yellow]Extracting Real-ESRGAN archive...[/yellow]")
+        import zipfile
+        with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+            zip_ref.extractall(cache_dir)
+            
+        try:
+            os.remove(zip_path)
+        except Exception:
+            pass
+            
+        # Robust check for nested folder
+        if not binary_path.exists():
+            for subdir in cache_dir.glob("realesrgan*macos*"):
+                if (subdir / "realesrgan-ncnn-vulkan").exists():
+                    for item in subdir.iterdir():
+                        target_item = cache_dir / item.name
+                        if target_item.exists():
+                            if target_item.is_dir():
+                                shutil.rmtree(target_item, ignore_errors=True)
+                            else:
+                                os.remove(target_item)
+                        shutil.move(str(item), str(cache_dir))
+                    shutil.rmtree(subdir, ignore_errors=True)
+                    break
+                    
+        if sys.platform == 'darwin' and binary_path.exists():
+            try:
+                subprocess.run(['xattr', '-d', 'com.apple.quarantine', str(binary_path)], stderr=subprocess.DEVNULL)
+            except Exception:
+                pass
+                
+        if binary_path.exists():
+            try:
+                os.chmod(binary_path, 0o755)
+            except Exception:
+                pass
+            return str(binary_path), str(models_dir)
+        else:
+            raise FileNotFoundError("realesrgan-ncnn-vulkan binary not found after extraction.")
+            
+    except Exception as e:
+        console.print(f"[bold red]Error downloading/extracting Real-ESRGAN:[/bold red] {e}")
+        console.print("Please ensure you have an active internet connection and write permissions to the .cache directory.")
+        sys.exit(1)
+
+def run_realesrgan_pipeline(input_path, output_path, model_name, scale, start_sec, duration_sec, 
+                            target_w, target_h, fps, total_frames, codec_choice, audio_action, 
+                            compare, is_mac, log_file_path, custom_quality=None, 
+                            deblock=False, denoise=False, sharpen=False):
+    """Executes the upscaling using Real-ESRGAN on GPU, with frame extraction, NCNN Vulkan upscale, and remuxing."""
+    binary_path, models_dir = download_realesrgan_binary()
+    
+    import uuid
+    # Create temp directory inside workspace's .cache/realesrgan to prevent filling up root partition
+    temp_dir = Path("./.cache/realesrgan") / f"tmp_{uuid.uuid4().hex}"
+    input_dir = temp_dir / "input"
+    output_dir = temp_dir / "output"
+    
+    try:
+        input_dir.mkdir(parents=True, exist_ok=True)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        
+        # 1. Frame Extraction
+        console.print("[cyan]Extracting video frames to temporary directory...[/cyan]")
+        extract_cmd = ['ffmpeg', '-y']
+        if start_sec > 0:
+            extract_cmd.extend(['-ss', f'{start_sec:.3f}'])
+        
+        # Calculate duration to use
+        duration_to_use = duration_sec
+        if duration_to_use is not None:
+            extract_cmd.extend(['-t', f'{duration_to_use:.3f}'])
+            
+        extract_cmd.extend(['-i', input_path])
+        
+        # Deblock / denoise filters applied to frame extraction
+        filters = []
+        if deblock:
+            filters.append("spp")
+        if denoise:
+            filters.append("hqdn3d=1.5:1.5:6:6")
+        if filters:
+            extract_cmd.extend(['-vf', ','.join(filters)])
+            
+        # Write frames to high-quality JPEG
+        extract_cmd.extend([
+            '-q:v', '2',
+            '-f', 'image2',
+            str(input_dir / 'frame_%08d.jpg')
+        ])
+        
+        res = subprocess.run(extract_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        if res.returncode != 0:
+            raise RuntimeError(f"FFmpeg frame extraction failed:\n{res.stderr}")
+            
+        # Count actual frames extracted
+        extracted_frames = sorted(list(input_dir.glob("frame_*.jpg")))
+        actual_total_frames = len(extracted_frames)
+        if actual_total_frames == 0:
+            raise RuntimeError("No frames were extracted. Check start time or video duration.")
+            
+        console.print(f"[green]✓ Extracted {actual_total_frames} frames.[/green]")
+        
+        # 2. Real-ESRGAN Upscaling
+        # Determine scale for the NCNN binary
+        if model_name in ['realesrgan-x4plus', 'realesrgan-x4plus-anime']:
+            binary_scale = 4
+        else:
+            binary_scale = scale
+            
+        realesr_cmd = [
+            str(binary_path),
+            '-i', str(input_dir),
+            '-o', str(output_dir) + '/',  # Real-ESRGAN needs a trailing slash for directories
+            '-n', model_name,
+            '-s', str(binary_scale),
+            '-m', str(models_dir),
+            '-f', 'png',
+            '-v'
+        ]
+        
+        console.print(f"[cyan]Upscaling frames via Real-ESRGAN ({model_name}, {binary_scale}x native)...[/cyan]")
+        
+        # We redirect stderr to stdout because realesrgan-ncnn-vulkan prints progress to stderr/stdout
+        proc = subprocess.Popen(
+            realesr_cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+            universal_newlines=True
+        )
+        
+        with Progress(
+            TextColumn("[bold blue]{task.description}"),
+            BarColumn(bar_width=40),
+            TaskProgressColumn(),
+            TimeRemainingColumn(),
+            FPSColumn(),
+            console=console
+        ) as progress:
+            task_id = progress.add_task("Super-Resolving...", total=actual_total_frames)
+            completed_frames = 0
+            
+            while True:
+                line = proc.stdout.readline()
+                if not line:
+                    break
+                
+                # NCNN outputs "[input] -> [output] done" when verbose is active
+                if " done" in line:
+                    completed_frames += 1
+                    progress.update(task_id, completed=min(completed_frames, actual_total_frames))
+                    
+            proc.wait()
+            if proc.returncode != 0:
+                raise RuntimeError(f"Real-ESRGAN execution failed with exit code {proc.returncode}.")
+                
+        # 3. Assembling / Remuxing to Output
+        console.print("[cyan]Assembling upscaled frames and encoding final video...[/cyan]")
+        
+        # Build video filter chain for target resizing and optional comparison layout
+        sharpen_filter = "unsharp=5:5:0.4:5:5:0.0"
+        
+        if compare:
+            font_path = get_font_file()
+            if font_path and is_drawtext_available():
+                escaped_font = font_path.replace(":", "\\:").replace("'", "'\\''")
+                draw_left = f",drawtext=text='ORIGINAL (BILINEAR)':x=20:y=20:fontfile='{escaped_font}':fontsize={int(target_h*0.035)}:fontcolor=white:box=1:boxcolor=black@0.5"
+                draw_right = f",drawtext=text='UPSCALED (REAL-ESRGAN)':x=20:y=20:fontfile='{escaped_font}':fontsize={int(target_h*0.035)}:fontcolor=white:box=1:boxcolor=black@0.5"
+            else:
+                draw_left = ""
+                draw_right = ""
+                
+            sharpen_opt = f",{sharpen_filter}" if sharpen else ""
+            
+            # Left half is original bilinear scaled to target_w x target_h, then cropped to left half
+            # Right half is upscaled frames scaled to target_w x target_h, then cropped to right half
+            filter_str = (
+                f"[0:v]scale={target_w}:{target_h}:flags=bilinear,crop={target_w//2}:{target_h}{draw_left}[left]; "
+                f"[1:v]scale={target_w}:{target_h}:flags=lanczos{sharpen_opt},crop={target_w//2}:{target_h}{draw_right}[right]; "
+                f"[left][right]hstack[out]"
+            )
+            video_map_args = ['-filter_complex', filter_str, '-map', '[out]']
+        else:
+            vf = f"scale={target_w}:{target_h}:flags=lanczos"
+            if sharpen:
+                vf += f",{sharpen_filter}"
+            video_map_args = ['-vf', vf, '-map', '1:v']
+            
+        remux_cmd = ['ffmpeg', '-y']
+        
+        # Input 0: original video (trimmed, for audio/left comparison source)
+        if start_sec > 0:
+            remux_cmd.extend(['-ss', f'{start_sec:.3f}'])
+        if duration_to_use is not None:
+            remux_cmd.extend(['-t', f'{duration_to_use:.3f}'])
+        remux_cmd.extend(['-i', input_path])
+        
+        # Input 1: upscaled frames directory
+        remux_cmd.extend([
+            '-f', 'image2',
+            '-framerate', str(fps),
+            '-i', str(output_dir / 'frame_%08d.png')
+        ])
+        
+        # Video encoding parameters
+        encoder_name, quality_args = get_codec_params(codec_choice, is_mac, custom_quality=custom_quality)
+        remux_cmd.extend(['-c:v', encoder_name])
+        remux_cmd.extend(quality_args)
+        remux_cmd.extend(video_map_args)
+        
+        # Audio mapping
+        if audio_action == 'copy':
+            remux_cmd.extend(['-map', '0:a?', '-c:a', 'copy'])
+        elif audio_action == 'aac':
+            remux_cmd.extend(['-map', '0:a?', '-c:a', 'aac', '-b:a', '192k'])
+        else:
+            remux_cmd.extend(['-an'])
+            
+        remux_cmd.extend(['-progress', '-', '-nostats'])
+        remux_cmd.append(output_path)
+        
+        lf = open(log_file_path, 'w')
+        proc_remux = subprocess.Popen(
+            remux_cmd,
+            stdout=subprocess.PIPE,
+            stderr=lf,
+            text=True,
+            bufsize=1,
+            universal_newlines=True
+        )
+        
+        with Progress(
+            TextColumn("[bold green]{task.description}"),
+            BarColumn(bar_width=40),
+            TaskProgressColumn(),
+            TimeRemainingColumn(),
+            FPSColumn(),
+            console=console
+        ) as progress:
+            task_id = progress.add_task("Encoding...", total=actual_total_frames)
+            while True:
+                line = proc_remux.stdout.readline()
+                if not line:
+                    break
+                line = line.strip()
+                if line.startswith('frame='):
+                    try:
+                        curr_frame = int(line.split('=')[1])
+                        progress.update(task_id, completed=min(curr_frame, actual_total_frames))
+                    except Exception:
+                        pass
+                elif line.startswith('progress=end'):
+                    break
+                    
+        lf.close()
+        proc_remux.wait()
+        if proc_remux.returncode != 0:
+            raise subprocess.CalledProcessError(proc_remux.returncode, remux_cmd)
+            
+    finally:
+        # Clean up temporary frames directory
+        if temp_dir.exists():
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
 def get_ffmpeg_filter(engine, scale, target_width, target_height, deblock=False, denoise=False, sharpen=False):
     """Builds the FFmpeg filter string for the chosen engine, including pre/post quality enhancement filters."""
     filters = []
@@ -364,7 +676,8 @@ def info(input_path):
 @cli.command()
 @click.argument('input_path', type=click.Path(exists=True, dir_okay=False))
 @click.option('--output', '-o', type=click.Path(), help="Output file path.")
-@click.option('--engine', '-e', type=click.Choice(['lanczos', 'hqx', 'xbr', 'epx', 'super2xsai', 'fsrcnn']), default='hqx', help="Upscaling engine filter.")
+@click.option('--engine', '-e', type=click.Choice(['lanczos', 'hqx', 'xbr', 'epx', 'super2xsai', 'fsrcnn', 'realesrgan']), default='hqx', help="Upscaling engine filter.")
+@click.option('--model', '-m', type=click.Choice(['realesr-animevideov3', 'realesrgan-x4plus', 'realesrgan-x4plus-anime']), default='realesr-animevideov3', help="Real-ESRGAN model choice.")
 @click.option('--scale', '-s', type=click.Choice(['2', '3', '4']), default='4', help="Upscaling factor.")
 @click.option('--trim', '-t', help="Trim the video. Format: 'seconds' or 'start,duration' (e.g. '10' or '60,10').")
 @click.option('--codec', '-c', type=click.Choice(['h264', 'hevc']), default='h264', help="Output video codec.")
@@ -375,7 +688,7 @@ def info(input_path):
 @click.option('--denoise', '-dn', is_flag=True, help="Apply a spatial/temporal denoising filter before upscaling.")
 @click.option('--deblock', '-db', is_flag=True, help="Apply a deblocking filter before upscaling.")
 @click.option('--sharpen', '-sp', is_flag=True, help="Apply an unsharp mask (sharpening) filter after upscaling.")
-def upscale(input_path, output, engine, scale, trim, codec, aspect, audio, compare, quality, denoise, deblock, sharpen):
+def upscale(input_path, output, engine, model, scale, trim, codec, aspect, audio, compare, quality, denoise, deblock, sharpen):
     """Upscale a video using mathematical, pixel-art, or AI-based models."""
     scale = int(scale)
     is_mac = sys.platform == 'darwin'
@@ -414,16 +727,21 @@ def upscale(input_path, output, engine, scale, trim, codec, aspect, audio, compa
             name_suffix += "_compare"
         output = str(Path(input_path).parent / f"{Path(input_path).stem}{name_suffix}.mp4")
         
-    # Check if FSRCNN model needs to be downloaded
+    # Check if FSRCNN or Real-ESRGAN model needs to be downloaded/configured
     model_path = None
     if engine == 'fsrcnn':
         model_path = download_fsrcnn_model(scale)
+    elif engine == 'realesrgan':
+        download_realesrgan_binary()
         
     # Print configuration summary
     summary = Table(title="Upscale Configuration Summary", title_style="bold magenta", show_header=False, box=None)
     summary.add_row("[cyan]Input Video:[/cyan]", input_path)
     summary.add_row("[cyan]Output Video:[/cyan]", output)
-    summary.add_row("[cyan]Engine:[/cyan]", f"{engine.upper()} ({scale}x)")
+    if engine == 'realesrgan':
+        summary.add_row("[cyan]Engine:[/cyan]", f"Real-ESRGAN ({scale}x) - Model: {model}")
+    else:
+        summary.add_row("[cyan]Engine:[/cyan]", f"{engine.upper()} ({scale}x)")
     summary.add_row("[cyan]Resolution Change:[/cyan]", f"{w}x{h} -> {target_w}x{target_h}")
     summary.add_row("[cyan]FPS:[/cyan]", f"{fps:.2f}")
     if trim:
@@ -462,6 +780,29 @@ def upscale(input_path, output, engine, scale, trim, codec, aspect, audio, compa
                 input_path=input_path,
                 output_path=output,
                 model_path=model_path,
+                scale=scale,
+                start_sec=start_sec,
+                duration_sec=duration_sec,
+                target_w=target_w,
+                target_h=target_h,
+                fps=fps,
+                total_frames=total_frames,
+                codec_choice=codec,
+                audio_action=audio if audio_stream else 'none',
+                compare=compare,
+                is_mac=is_mac,
+                log_file_path=log_file_path,
+                custom_quality=quality,
+                deblock=deblock,
+                denoise=denoise,
+                sharpen=sharpen
+            )
+        elif engine == 'realesrgan':
+            # RUNNING REAL-ESRGAN PIPELINE
+            run_realesrgan_pipeline(
+                input_path=input_path,
+                output_path=output,
+                model_name=model,
                 scale=scale,
                 start_sec=start_sec,
                 duration_sec=duration_sec,
@@ -540,7 +881,7 @@ def run_ffmpeg_pipeline(input_path, output_path, engine, scale, start_sec, durat
     
     if compare:
         font_path = get_font_file()
-        if font_path:
+        if font_path and is_drawtext_available():
             escaped_font = font_path.replace(":", "\\:").replace("'", "'\\''")
             draw_left = f",drawtext=text='ORIGINAL (BILINEAR)':x=20:y=20:fontfile='{escaped_font}':fontsize={int(target_h*0.035)}:fontcolor=white:box=1:boxcolor=black@0.5"
             draw_right = f",drawtext=text='UPSCALED ({engine.upper()})':x=20:y=20:fontfile='{escaped_font}':fontsize={int(target_h*0.035)}:fontcolor=white:box=1:boxcolor=black@0.5"
@@ -788,10 +1129,14 @@ def compare_all(input_path, output, trim, scale):
     duration_to_use = duration_sec if duration_sec is not None else 5.0
     total_frames = int(duration_to_use * fps)
     
-    console.print(f"[magenta]Generating a 4-way comparison grid (Original, Lanczos, HQX, FSRCNN) of {duration_to_use:.1f}s...[/magenta]")
+    console.print(f"[magenta]Generating a 4-way comparison grid (Original, Lanczos, FSRCNN, Real-ESRGAN) of {duration_to_use:.1f}s...[/magenta]")
     
-    # We will build this comparison using Python frames to avoid complex shell filter syntax, 
-    # ensuring we can overlay grid lines and texts accurately.
+    # Build temp directory for Real-ESRGAN rendering
+    import uuid
+    temp_dir = Path("./.cache/realesrgan") / f"tmp_{uuid.uuid4().hex}"
+    input_dir = temp_dir / "input"
+    output_dir = temp_dir / "output"
+    
     # Download FSRCNN model
     model_path = download_fsrcnn_model(scale)
     
@@ -800,126 +1145,193 @@ def compare_all(input_path, output, trim, scale):
     sr.readModel(model_path)
     sr.setModel("fsrcnn", scale)
     
-    # Open capture
-    cap = cv2.VideoCapture(input_path)
-    if start_sec > 0:
-        start_frame = int(start_sec * fps)
-        cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
-        
-    # Grid dimensions (2x2 grid, each cell is target_w x target_h, total size is 2*target_w x 2*target_h)
-    grid_w = target_w * 2
-    grid_h = target_h * 2
-    
-    ffmpeg_cmd = [
-        'ffmpeg', '-y',
-        '-f', 'rawvideo',
-        '-pix_fmt', 'bgr24',
-        '-s', f'{grid_w}x{grid_h}',
-        '-r', str(fps),
-        '-i', '-',  # Read from stdin
-        '-an'       # No audio for comparison grid
-    ]
-    
-    encoder_name, quality_args = get_codec_params('h264', is_mac)
-    ffmpeg_cmd.extend(['-c:v', encoder_name])
-    ffmpeg_cmd.extend(quality_args)
-    ffmpeg_cmd.append(output)
-    
     log_file = tempfile.NamedTemporaryFile(mode='w+', suffix='.log', delete=False)
     log_file_path = log_file.name
     log_file.close()
     
-    lf = open(log_file_path, 'w')
-    proc = subprocess.Popen(ffmpeg_cmd, stdin=subprocess.PIPE, stderr=lf)
-    
-    # Initialize CPU-based filters (hqx and xbr via opencv fallbacks or ffmpeg filters? 
-    # To keep this grid generator 100% self-contained and fast, we can use OpenCV resize (bilinear/lanczos) 
-    # and OpenCV FSRCNN. For hqx/xbr in a 4-way grid, we can show:
-    # 1. Top Left: Original (Nearest Neighbor)
-    # 2. Top Right: Bilinear Interpolation (standard player scale)
-    # 3. Bottom Left: Lanczos Interpolation (high-quality math)
-    # 4. Bottom Right: FSRCNN (AI Super Resolution)
-    # This is a very clean, representative grid!)
-    
-    with Progress(
-        TextColumn("[bold blue]{task.description}"),
-        BarColumn(bar_width=40),
-        TaskProgressColumn(),
-        TimeRemainingColumn(),
-        FPSColumn(),
-        console=console
-    ) as progress:
-        task_id = progress.add_task("Creating Comparison Grid...", total=total_frames)
+    try:
+        input_dir.mkdir(parents=True, exist_ok=True)
+        output_dir.mkdir(parents=True, exist_ok=True)
         
-        try:
-            for i in range(total_frames):
-                ret, frame = cap.read()
-                if not ret:
-                    break
-                    
-                # Cell 1: Original (Nearest Neighbor)
-                c1 = cv2.resize(frame, (target_w, target_h), interpolation=cv2.INTER_NEAREST)
-                
-                # Cell 2: Bilinear
-                c2 = cv2.resize(frame, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
-                
-                # Cell 3: Lanczos
-                c3 = cv2.resize(frame, (target_w, target_h), interpolation=cv2.INTER_LANCZOS4)
-                
-                # Cell 4: FSRCNN AI
-                c4 = sr.upsample(frame)
-                if c4.shape[1] != target_w or c4.shape[0] != target_h:
-                    c4 = cv2.resize(c4, (target_w, target_h), interpolation=cv2.INTER_LANCZOS4)
-                    
-                # Overlay labels
-                h_scale = target_h / 500.0
-                font_scale = 0.8 * h_scale
-                font_thickness = max(1, int(2 * h_scale))
-                y_offset = int(40 * h_scale)
-                
-                for cell, label in [(c1, "1. ORIGINAL (NEAREST)"), 
-                                    (c2, "2. BILINEAR (STANDARD)"), 
-                                    (c3, "3. LANCZOS (HIGH-QUALITY MATH)"), 
-                                    (c4, "4. AI FSRCNN (SUPER RESOLUTION)")]:
-                    cv2.putText(cell, label, (20, y_offset), cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 0, 0), font_thickness + 2, cv2.LINE_AA)
-                    cv2.putText(cell, label, (20, y_offset), cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255, 255, 255), font_thickness, cv2.LINE_AA)
-                    
-                # Combine into grid (top row, bottom row)
-                top_row = np.hstack((c1, c2))
-                bottom_row = np.hstack((c3, c4))
-                grid_frame = np.vstack((top_row, bottom_row))
-                
-                # Draw grid dividers (black borders)
-                cv2.line(grid_frame, (target_w, 0), (target_w, grid_h), (0, 0, 0), 4)
-                cv2.line(grid_frame, (0, target_h), (grid_w, target_h), (0, 0, 0), 4)
-                
-                # Write raw frames
-                proc.stdin.write(grid_frame.tobytes())
-                progress.update(task_id, completed=i+1)
-                
-        except Exception as e:
-            console.print(f"[red]Error building comparison grid: {e}[/red]")
-        finally:
-            cap.release()
-            if proc.stdin:
-                proc.stdin.close()
-            proc.wait()
-            lf.close()
+        # 1. Extract frames for the Real-ESRGAN input
+        console.print("[cyan]Extracting comparison frames...[/cyan]")
+        extract_cmd = [
+            'ffmpeg', '-y',
+            '-ss', f'{start_sec:.3f}',
+            '-t', f'{duration_to_use:.3f}',
+            '-i', input_path,
+            '-q:v', '2',
+            '-f', 'image2',
+            str(input_dir / 'frame_%08d.jpg')
+        ]
+        res = subprocess.run(extract_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        if res.returncode != 0:
+            raise RuntimeError(f"Comparison frame extraction failed:\n{res.stderr}")
             
-    if proc.returncode == 0:
-        console.print(f"\n[bold green]✓ Comparison grid generated successfully![/bold green]")
-        console.print(f"Output saved to: [cyan]{output}[/cyan]")
-    else:
-        console.print(f"[bold red]Failed to encode comparison grid.[/bold red]")
-        if os.path.exists(log_file_path):
-            with open(log_file_path, 'r') as lf:
-                console.print(Panel(lf.read(), title="FFmpeg Errors", border_style="red"))
+        extracted_frames = sorted(list(input_dir.glob("frame_*.jpg")))
+        actual_total_frames = len(extracted_frames)
+        if actual_total_frames == 0:
+            raise RuntimeError("No frames extracted for comparison grid.")
+            
+        # 2. Run Real-ESRGAN
+        binary_path, models_dir = download_realesrgan_binary()
+        realesr_cmd = [
+            str(binary_path),
+            '-i', str(input_dir),
+            '-o', str(output_dir) + '/',
+            '-n', 'realesr-animevideov3',
+            '-s', str(scale),
+            '-m', str(models_dir),
+            '-f', 'png',
+            '-v'
+        ]
+        
+        console.print("[cyan]Pre-rendering Real-ESRGAN comparison frames...[/cyan]")
+        proc_realesr = subprocess.Popen(
+            realesr_cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+            universal_newlines=True
+        )
+        
+        with Progress(
+            TextColumn("[bold blue]{task.description}"),
+            BarColumn(bar_width=40),
+            TaskProgressColumn(),
+            TimeRemainingColumn(),
+            console=console
+        ) as progress:
+            task_id = progress.add_task("Super-Resolving...", total=actual_total_frames)
+            completed = 0
+            while True:
+                line = proc_realesr.stdout.readline()
+                if not line:
+                    break
+                if " done" in line:
+                    completed += 1
+                    progress.update(task_id, completed=min(completed, actual_total_frames))
+            proc_realesr.wait()
+            if proc_realesr.returncode != 0:
+                raise RuntimeError(f"Real-ESRGAN comparison pre-render failed with exit code {proc_realesr.returncode}.")
                 
-    if os.path.exists(log_file_path):
-        try:
-            os.remove(log_file_path)
-        except Exception:
-            pass
+        # 3. Open capture and start writing output grid
+        cap = cv2.VideoCapture(input_path)
+        if start_sec > 0:
+            start_frame = int(start_sec * fps)
+            cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+            
+        grid_w = target_w * 2
+        grid_h = target_h * 2
+        
+        ffmpeg_cmd = [
+            'ffmpeg', '-y',
+            '-f', 'rawvideo',
+            '-pix_fmt', 'bgr24',
+            '-s', f'{grid_w}x{grid_h}',
+            '-r', str(fps),
+            '-i', '-',  # Read from stdin
+            '-an'       # No audio for comparison grid
+        ]
+        
+        encoder_name, quality_args = get_codec_params('h264', is_mac)
+        ffmpeg_cmd.extend(['-c:v', encoder_name])
+        ffmpeg_cmd.extend(quality_args)
+        ffmpeg_cmd.append(output)
+        
+        lf = open(log_file_path, 'w')
+        proc = subprocess.Popen(ffmpeg_cmd, stdin=subprocess.PIPE, stderr=lf)
+        
+        with Progress(
+            TextColumn("[bold blue]{task.description}"),
+            BarColumn(bar_width=40),
+            TaskProgressColumn(),
+            TimeRemainingColumn(),
+            FPSColumn(),
+            console=console
+        ) as progress:
+            task_id = progress.add_task("Assembling Grid...", total=actual_total_frames)
+            
+            try:
+                for i in range(actual_total_frames):
+                    ret, frame = cap.read()
+                    if not ret:
+                        break
+                        
+                    # Cell 1: Original Bilinear
+                    c1 = cv2.resize(frame, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
+                    
+                    # Cell 2: Lanczos
+                    c2 = cv2.resize(frame, (target_w, target_h), interpolation=cv2.INTER_LANCZOS4)
+                    
+                    # Cell 3: FSRCNN AI
+                    c3 = sr.upsample(frame)
+                    if c3.shape[1] != target_w or c3.shape[0] != target_h:
+                        c3 = cv2.resize(c3, (target_w, target_h), interpolation=cv2.INTER_LANCZOS4)
+                        
+                    # Cell 4: Real-ESRGAN
+                    realesr_file = output_dir / f"frame_{i+1:08d}.png"
+                    if realesr_file.exists():
+                        c4 = cv2.imread(str(realesr_file))
+                        # Aspect ratio sizing check
+                        if c4.shape[1] != target_w or c4.shape[0] != target_h:
+                            c4 = cv2.resize(c4, (target_w, target_h), interpolation=cv2.INTER_LANCZOS4)
+                    else:
+                        c4 = c2.copy()
+                        
+                    # Overlay labels
+                    h_scale = target_h / 500.0
+                    font_scale = 0.8 * h_scale
+                    font_thickness = max(1, int(2 * h_scale))
+                    y_offset = int(40 * h_scale)
+                    
+                    for cell, label in [(c1, "1. ORIGINAL (BILINEAR)"), 
+                                        (c2, "2. LANCZOS (HIGH-QUALITY MATH)"), 
+                                        (c3, "3. AI FSRCNN (SUPER RESOLUTION)"), 
+                                        (c4, "4. REAL-ESRGAN (PREMIUM GPU AI)")]:
+                        cv2.putText(cell, label, (20, y_offset), cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 0, 0), font_thickness + 2, cv2.LINE_AA)
+                        cv2.putText(cell, label, (20, y_offset), cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255, 255, 255), font_thickness, cv2.LINE_AA)
+                        
+                    # Combine into grid (top row, bottom row)
+                    top_row = np.hstack((c1, c2))
+                    bottom_row = np.hstack((c3, c4))
+                    grid_frame = np.vstack((top_row, bottom_row))
+                    
+                    # Draw grid dividers (black borders)
+                    cv2.line(grid_frame, (target_w, 0), (target_w, grid_h), (0, 0, 0), 4)
+                    cv2.line(grid_frame, (0, target_h), (grid_w, target_h), (0, 0, 0), 4)
+                    
+                    # Write raw frames
+                    proc.stdin.write(grid_frame.tobytes())
+                    progress.update(task_id, completed=i+1)
+                    
+            except Exception as e:
+                console.print(f"[red]Error building comparison grid: {e}[/red]")
+            finally:
+                cap.release()
+                if proc.stdin:
+                    proc.stdin.close()
+                proc.wait()
+                lf.close()
+                
+        if proc.returncode == 0:
+            console.print(f"\n[bold green]✓ Comparison grid generated successfully![/bold green]")
+            console.print(f"Output saved to: [cyan]{output}[/cyan]")
+        else:
+            console.print(f"[bold red]Failed to encode comparison grid.[/bold red]")
+            if os.path.exists(log_file_path):
+                with open(log_file_path, 'r') as lf:
+                    console.print(Panel(lf.read(), title="FFmpeg Errors", border_style="red"))
+                    
+    finally:
+        if temp_dir.exists():
+            shutil.rmtree(temp_dir, ignore_errors=True)
+        if os.path.exists(log_file_path):
+            try:
+                os.remove(log_file_path)
+            except Exception:
+                pass
 
 def run_interactive_wizard():
     """Launches an interactive wizard to configure and run upscaling."""
@@ -974,19 +1386,32 @@ def run_interactive_wizard():
         
     # 2. Ask for engine
     console.print("\n[cyan]Select Upscaling Engine:[/cyan]")
-    console.print("  [1] hqx (Recommended for sharp pixel-art / crisp lines)")
-    console.print("  [2] fsrcnn (Recommended AI model, best quality for real scenes)")
-    console.print("  [3] lanczos (Fastest high-quality mathematical scaling)")
-    console.print("  [4] xbr (High-quality anti-aliasing curve scaling)")
-    console.print("  [5] epx / super2xsai (Classic game magnification filters)")
+    console.print("  [1] realesrgan (Premium AI model, best quality for real video and animations, GPU accelerated)")
+    console.print("  [2] fsrcnn (Recommended light AI model, fast, high quality)")
+    console.print("  [3] hqx (Recommended for sharp pixel-art / crisp lines)")
+    console.print("  [4] lanczos (Fastest high-quality mathematical scaling)")
+    console.print("  [5] xbr (High-quality anti-aliasing curve scaling)")
+    console.print("  [6] epx / super2xsai (Classic game magnification filters)")
     
-    engine_choice = Prompt.ask("Select engine", choices=["1", "2", "3", "4", "5"], default="1")
-    engine_map = {"1": "hqx", "2": "fsrcnn", "3": "lanczos", "4": "xbr", "5": "epx"}
+    engine_choice = Prompt.ask("Select engine", choices=["1", "2", "3", "4", "5", "6"], default="1")
+    engine_map = {"1": "realesrgan", "2": "fsrcnn", "3": "hqx", "4": "lanczos", "5": "xbr", "6": "epx"}
     engine = engine_map[engine_choice]
     
     # 3. Ask for scaling factor
     scale = Prompt.ask("\nSelect scaling factor (2x, 3x, or 4x)", choices=["2", "3", "4"], default="4")
     
+    model = None
+    if engine == "realesrgan":
+        console.print("\n[cyan]Select Real-ESRGAN Model:[/cyan]")
+        console.print("  [1] realesr-animevideov3 (Fast, supports 2x/3x/4x, recommended for anime/video)")
+        console.print("  [2] realesrgan-x4plus (Premium, 4x only, detailed real-world images)")
+        console.print("  [3] realesrgan-x4plus-anime (Premium, 4x only, anime/illustrations)")
+        model_choice = Prompt.ask("Select model", choices=["1", "2", "3"], default="1")
+        model_map = {"1": "realesr-animevideov3", "2": "realesrgan-x4plus", "3": "realesrgan-x4plus-anime"}
+        model = model_map[model_choice]
+        if model in ['realesrgan-x4plus', 'realesrgan-x4plus-anime'] and scale != "4":
+            console.print("[yellow]Note: x4plus models natively only support 4x scale. Lower scales will be achieved by downscaling the 4x output.[/yellow]")
+            
     # 4. Ask for trim
     trim_confirm = Confirm.ask("\nDo you want to trim the video first (highly recommended for testing)?", default=True)
     trim = None
@@ -1004,6 +1429,8 @@ def run_interactive_wizard():
         
     # Build target output file
     name_suffix = f"_{engine}_{scale}x"
+    if engine == "realesrgan" and model:
+        name_suffix = f"_{model}_{scale}x"
     if compare:
         name_suffix += "_compare"
     default_out = str(Path(input_path).parent / f"{Path(input_path).stem}{name_suffix}.mp4")
@@ -1020,6 +1447,8 @@ def run_interactive_wizard():
         "--aspect", aspect,
         "--audio", "aac" if audio else "none"
     ]
+    if engine == "realesrgan" and model:
+        sys.argv.extend(["--model", model])
     if trim:
         sys.argv.extend(["--trim", trim])
     if compare:
