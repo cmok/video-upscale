@@ -1333,6 +1333,223 @@ def compare_all(input_path, output, trim, scale):
             except Exception:
                 pass
 
+@cli.command()
+@click.argument('input_path', type=click.Path(exists=True, dir_okay=False))
+@click.option('--output-dir', '-o', type=click.Path(), help="Output directory for extracted PNG frames. Defaults to [video_name]_iframes.")
+@click.option('--start', '-s', help="Start time (e.g. 10, 1:23, 01:23:45). Defaults to start of video.")
+@click.option('--end', '-e', help="End time (e.g. 20, 1:30, 01:24:05). Defaults to end of video.")
+@click.option('--sequential', is_flag=True, help="Number files sequentially (frame_0001.png...) instead of preserving frame indices (PTS).")
+def extract_iframes(input_path, output_dir, start, end, sequential):
+    """Extract keyframes (I-frames) from a video within an optional time range as PNGs."""
+    video, audio, fmt = get_video_info(input_path)
+    if not video:
+        console.print("[bold red]Error:[/bold red] Input file contains no video stream.")
+        sys.exit(1)
+
+    total_duration_str = fmt.get('duration')
+    total_duration = float(total_duration_str) if total_duration_str else None
+
+    # Parse times
+    start_sec = 0.0
+    if start:
+        start_sec = parse_time_str(start)
+        
+    end_sec = total_duration
+    if end:
+        end_sec = parse_time_str(end)
+
+    if total_duration and start_sec > total_duration:
+        console.print(f"[bold red]Error:[/bold red] Start time ({start_sec}s) is greater than video duration ({total_duration:.2f}s).")
+        sys.exit(1)
+        
+    if end_sec is not None and start_sec >= end_sec:
+        console.print(f"[bold red]Error:[/bold red] Start time ({start_sec}s) must be less than end time ({end_sec}s).")
+        sys.exit(1)
+
+    # Set up output directory
+    if not output_dir:
+        output_dir = str(Path(input_path).parent / f"{Path(input_path).stem}_iframes")
+    
+    out_path = Path(output_dir)
+    out_path.mkdir(parents=True, exist_ok=True)
+
+    console.print(f"[cyan]Extracting keyframes (I-frames) from [magenta]{Path(input_path).name}[/magenta]...[/cyan]")
+    time_range_str = f"from {format_duration(str(start_sec))}"
+    if end_sec is not None:
+        time_range_str += f" to {format_duration(str(end_sec))}"
+    else:
+        time_range_str += " to end of video"
+    console.print(f"[cyan]Range: {time_range_str}[/cyan]")
+    console.print(f"[cyan]Output directory: [yellow]{out_path.resolve()}[/yellow][/cyan]\n")
+
+    # Build select filter expression with time boundaries
+    select_filter = "eq(pict_type,I)"
+    if start_sec > 0 and end_sec is not None:
+        select_filter += f"*between(t,{start_sec:.3f},{end_sec:.3f})"
+    elif start_sec > 0:
+        select_filter += f"*gte(t,{start_sec:.3f})"
+    elif end_sec is not None:
+        select_filter += f"*lte(t,{end_sec:.3f})"
+
+    # Build FFmpeg command
+    cmd = ['ffmpeg', '-y', '-i', input_path]
+    
+    cmd.extend([
+        '-vf', f"select='{select_filter}'",
+        '-fps_mode', 'vfr'
+    ])
+    
+    if not sequential:
+        cmd.extend(['-frame_pts', 'true'])
+        
+    cmd.append(str(out_path / "frame_%04d.png"))
+
+    # Execute FFmpeg
+    try:
+        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True)
+        # Check how many files were generated
+        files = sorted(list(out_path.glob("frame_*.png")))
+        if not files:
+            console.print("[yellow]No I-frames found in the specified time range.[/yellow]")
+        else:
+            console.print(f"[bold green]✓ Successfully extracted {len(files)} I-frame(s)![/bold green]")
+            table = Table(title="Extracted Keyframes", title_style="bold green", show_header=True)
+            table.add_column("File Name", style="cyan")
+            table.add_column("Source Time (approx)", style="magenta")
+            
+            # Get video fps to calculate time if sequential was NOT used (as they represent frame PTS)
+            fps_str = video.get('avg_frame_rate', video.get('r_frame_rate', '25/1'))
+            if '/' in fps_str:
+                num, den = map(float, fps_str.split('/'))
+                fps = num / den if den != 0 else 25.0
+            else:
+                fps = float(fps_str)
+
+            for f in files:
+                stem = f.stem
+                try:
+                    num_part = int(stem.split('_')[1])
+                    if not sequential:
+                        time_sec = num_part / fps
+                        time_display = format_duration(str(time_sec))
+                    else:
+                        time_display = "N/A (sequential)"
+                except Exception:
+                    time_display = "Unknown"
+                table.add_row(f.name, time_display)
+            console.print(table)
+    except subprocess.CalledProcessError as e:
+        console.print("[bold red]FFmpeg failed to extract keyframes:[/bold red]")
+        console.print(e.stderr)
+        sys.exit(1)
+
+@cli.command()
+@click.argument('input_path', type=click.Path(exists=True, dir_okay=False))
+@click.option('--output', '-o', type=click.Path(), help="Output image file path.")
+@click.option('--engine', '-e', type=click.Choice(['realesrgan', 'fsrcnn', 'lanczos', 'hqx', 'xbr']), default='realesrgan', help="Upscaling engine.")
+@click.option('--scale', '-s', type=click.Choice(['2', '3', '4']), default='4', help="Upscaling factor.")
+@click.option('--model', '-m', type=click.Choice(['realesr-animevideov3', 'realesrgan-x4plus', 'realesrgan-x4plus-anime']), default='realesr-animevideov3', help="Real-ESRGAN model choice.")
+@click.option('--denoise', '-dn', is_flag=True, help="Apply denoising filter before upscaling.")
+@click.option('--sharpen', '-sp', is_flag=True, help="Apply sharpening (unsharp mask) after upscaling.")
+def upscale_image(input_path, output, engine, scale, model, denoise, sharpen):
+    """Upscale a single image using AI or mathematical algorithms."""
+    scale = int(scale)
+    
+    # Read image
+    img = cv2.imread(input_path)
+    if img is None:
+        console.print(f"[bold red]Error:[/bold red] Could not read image at {input_path}")
+        sys.exit(1)
+        
+    h, w, _ = img.shape
+    
+    # Denoise if requested
+    if denoise:
+        console.print("[cyan]Applying denoising to image...[/cyan]")
+        img = cv2.fastNlMeansDenoisingColored(img, None, 10, 10, 7, 21)
+        
+    # Scale calculation
+    if not output:
+        ext = Path(input_path).suffix
+        if not ext:
+            ext = ".png"
+        output = str(Path(input_path).parent / f"{Path(input_path).stem}_{engine}_{scale}x{ext}")
+        
+    if engine == 'realesrgan':
+        # Invoke realesrgan binary
+        binary_path, models_dir = download_realesrgan_binary()
+        
+        # Real-ESRGAN binary works with temp files for single image
+        import uuid
+        temp_input = Path(f"./.cache/realesrgan/tmp_in_{uuid.uuid4().hex}.png")
+        temp_output = Path(f"./.cache/realesrgan/tmp_out_{uuid.uuid4().hex}.png")
+        
+        try:
+            cv2.imwrite(str(temp_input), img)
+            
+            realesr_cmd = [
+                binary_path,
+                '-i', str(temp_input),
+                '-o', str(temp_output),
+                '-n', model,
+                '-s', str(scale),
+                '-m', models_dir,
+                '-f', 'png'
+            ]
+            
+            console.print(f"[cyan]Upscaling image via Real-ESRGAN ({model}, {scale}x)...[/cyan]")
+            subprocess.run(realesr_cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            
+            if not temp_output.exists():
+                raise RuntimeError("Real-ESRGAN did not produce the expected output image.")
+                
+            out_img = cv2.imread(str(temp_output))
+        finally:
+            if temp_input.exists():
+                os.remove(temp_input)
+            if temp_output.exists():
+                os.remove(temp_output)
+                
+    elif engine == 'fsrcnn':
+        model_path = download_fsrcnn_model(scale)
+        sr = cv2.dnn_superres.DnnSuperResImpl_create()
+        sr.readModel(model_path)
+        sr.setModel("fsrcnn", scale)
+        console.print(f"[cyan]Upscaling image via FSRCNN ({scale}x)...[/cyan]")
+        out_img = sr.upsample(img)
+        
+    elif engine == 'lanczos':
+        console.print(f"[cyan]Upscaling image via Lanczos ({scale}x)...[/cyan]")
+        out_img = cv2.resize(img, (w * scale, h * scale), interpolation=cv2.INTER_LANCZOS4)
+        
+    elif engine == 'hqx' or engine == 'xbr':
+        import uuid
+        temp_input = Path(f"./.cache/tmp_in_{uuid.uuid4().hex}.png")
+        temp_output = Path(f"./.cache/tmp_out_{uuid.uuid4().hex}.png")
+        try:
+            cv2.imwrite(str(temp_input), img)
+            n = scale if scale in [2, 3, 4] else 2
+            vf = f"{engine}=n={n}"
+            ffmpeg_cmd = ['ffmpeg', '-y', '-i', str(temp_input), '-vf', vf, str(temp_output)]
+            subprocess.run(ffmpeg_cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            out_img = cv2.imread(str(temp_output))
+        finally:
+            if temp_input.exists():
+                os.remove(temp_input)
+            if temp_output.exists():
+                os.remove(temp_output)
+                
+    # Sharpen if requested
+    if sharpen:
+        console.print("[cyan]Applying sharpening (unsharp mask) to upscaled image...[/cyan]")
+        gaussian_3 = cv2.GaussianBlur(out_img, (5, 5), 1.5)
+        out_img = cv2.addWeighted(out_img, 1.5, gaussian_3, -0.5, 0)
+        
+    # Save output
+    cv2.imwrite(output, out_img)
+    console.print(f"[bold green]✓ Successfully upscaled image![/bold green]")
+    console.print(f"Output saved to: [cyan]{output}[/cyan]")
+
 def run_interactive_wizard():
     """Launches an interactive wizard to configure and run upscaling."""
     console.print(Panel("[bold magenta]Welcome to the Video Upscaler Interactive Wizard![/bold magenta]\n"

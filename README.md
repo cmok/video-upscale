@@ -20,6 +20,8 @@ The tool is optimized for **macOS Apple Silicon** (M-series chips), automaticall
 *   **Snippet/Test Mode (`--trim`)**: Easily trim a short segment (e.g. 5 seconds) to check quality configurations before running a full-length upscale.
 *   **Split-Screen Comparison (`--compare`)**: Generate a side-by-side video comparing the original video (scaled bilinearly) with the upscaled video.
 *   **4-Way Grid Comparison (`compare-all` command)**: Create a grid video comparing Original (Bilinear), Lanczos, AI FSRCNN, and Premium Real-ESRGAN side-by-side to choose the best configuration.
+*   **Keyframe Extraction (`extract-iframes` command)**: Extract keyframes (I-frames) from a video as PNG files within a specified start and end time range.
+*   **Image Upscaling (`upscale-image` command)**: Upscale single images (PNG, JPG, WEBP) using AI or mathematical models with optional denoising and sharpening filters.
 *   **Interactive Guided Setup**: Running the script without arguments starts a step-by-step visual configuration wizard.
 
 ---
@@ -76,6 +78,29 @@ Create a 5-second 4-way comparison video grid (Original Bilinear vs. Lanczos vs.
 ```bash
 uv run upscale.py compare-all input-videos/AVSEQ01.DAT -o grid_compare.mp4 --trim 5 --scale 2
 ```
+
+### 6. Extract Keyframes (I-frames)
+Extract keyframes (I-frames) from a video as PNG files within a specific time window:
+```bash
+uv run upscale.py extract-iframes input-videos/AVSEQ01.DAT -s 00:01:00 -e 00:01:30 -o output_iframes/
+```
+Options for `extract-iframes`:
+*   `--start` / `-s`: Start time (e.g., `10` or `01:23`).
+*   `--end` / `-e`: End time (e.g., `20` or `01:30`).
+*   `--output-dir` / `-o`: Directory to save the output PNGs.
+*   `--sequential`: Flag to number the files sequentially (`frame_0001.png`...) rather than using the absolute frame PTS number (e.g., `frame_0300.png` at 30fps = 10 seconds).
+
+### 7. Upscale a Single Image
+Upscale a single image (PNG, JPG, WEBP) using Real-ESRGAN (AI), FSRCNN (AI), or other filters:
+```bash
+uv run upscale.py upscale-image input-videos/screenshot-001.png -o output_image.png --engine realesrgan --scale 4 --denoise --sharpen
+```
+Options for `upscale-image`:
+*   `--engine` / `-e`: Upscaling engine (`realesrgan`, `fsrcnn`, `lanczos`, `hqx`, `xbr`).
+*   `--scale` / `-s`: Scale factor (`2`, `3`, `4`).
+*   `--model` / `-m`: Real-ESRGAN model choice (e.g. `realesr-animevideov3` or `realesrgan-x4plus`).
+*   `--denoise` / `-dn`: Apply denoising filter before upscaling.
+*   `--sharpen` / `-sp`: Apply unsharp mask sharpening filter after upscaling.
 
 ---
 
